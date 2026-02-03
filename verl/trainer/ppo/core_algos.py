@@ -768,11 +768,14 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio
 
-
+#pg_loss = agg_loss(
+#        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+#    )
 def agg_loss(
     loss_mat: torch.Tensor,
     loss_mask: torch.Tensor,
     loss_agg_mode: str,
+    #clipfrac: float=0.0,
     dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
@@ -802,7 +805,7 @@ def agg_loss(
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             batch_num_tokens = loss_mask.sum()
-        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size 
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
@@ -902,7 +905,41 @@ def compute_policy_loss(
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
+def ppo_clip(ref_logprob, low_clip=0.1, high_clip=0.2, clip_ratio_c=float("inf")):
+    
+    return 0.8, 1.2
 
+def dapo_clip(ref_logprob, low_clip=0.1, high_clip=0.2, clip_ratio_c=float("inf")):
+    
+    return 0.8, 1.28
+    
+def dcpo_clip(ref_logprob, low_clip=0.1, high_clip=0.2, clip_ratio_c=float("inf")):
+    ref_prob = torch.exp(ref_logprob)
+    low_clip=0.16
+    high_clip=0.2
+    # new_prob = torch.exp(new_logprob)
+    # ratio = torch.exp(new_logprob-ref_logprob)
+    low_c_ref = torch.where(ref_prob != 0, 4 * low_clip / (ref_prob), 0)
+    low_c_ref = 1 - low_c_ref
+    low_c_ref = low_c_ref * (low_c_ref >= 0)
+    high_c_ref = 4 * high_clip / ref_prob
+    high_c_ref = torch.where(ref_prob != 0, 1 + 4 * high_clip / ref_prob, float("inf"))
+    low = (1 + torch.sqrt(low_c_ref)) / 2
+    high = (1 + torch.sqrt(high_c_ref)) / 2
+    # 最小10
+    clip_ratio_c = max(clip_ratio_c, 10)
+    return low, torch.clamp(high, 0, clip_ratio_c)
+
+def ripo_clip(ref_logprob, low_clip=0.05, high_clip=0.05, clip_ratio_c=float("inf")):
+    ref_prob = torch.exp(ref_logprob)
+
+    low_c_ref = torch.where(ref_prob != 0, low_clip / ref_prob, 0)
+    high_c_ref = torch.where(ref_prob != 0, high_clip / ref_prob, float("inf"))
+
+    low = 1 - torch.sqrt(low_c_ref)
+    high = 1 + torch.sqrt(high_c_ref)
+    return torch.clamp(low, 0.5, 1), torch.clamp(high, 0, 10)
+    
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
@@ -910,7 +947,7 @@ def compute_policy_loss_vanilla(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
-    config: Optional[ActorConfig] = None,
+    config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
@@ -965,8 +1002,11 @@ def compute_policy_loss_vanilla(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
+
+    #####  Dynamic CLIP  #####
+    cliprange_low, cliprange_high = ripo_clip(old_log_prob, cliprange_low, cliprange_high, clip_ratio_c)
     pg_losses2 = -advantages * torch.clamp(
-        ratio, 1 - cliprange_low, 1 + cliprange_high
+        ratio, cliprange_low, cliprange_high
     )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
@@ -980,14 +1020,15 @@ def compute_policy_loss_vanilla(
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    ##pg_losses = pg_losses/(1-(pg_clipfrac+pg_clipfrac_lower)) ##Unbias Policy Gradient
+    ##pg_losses = pg_losses1 ##No-Clip Version of Policy Gradient
+    ##pg_losses = -advantages * log_prob ##No-IS Version of Policy Gradient
 
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
-    )
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
@@ -1656,7 +1697,8 @@ def compute_policy_loss_with_rollout_correction(
 
     """
     # Import rollout correction helper
-    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_rejection_mask
+    from verl.trainer.ppo.rollout_corr_helper import \
+        compute_rollout_correction_and_rejection_mask
 
     assert config is not None, "ActorConfig must be provided for rollout correction"
 
